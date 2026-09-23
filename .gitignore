@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.bak
+.venv/
+trendshift_data.*
+.DS_Store
