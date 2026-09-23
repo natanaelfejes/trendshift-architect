@@ -48,39 +48,13 @@ def ensure_playwright_browsers():
 class TrendshiftWizard(App):
     TITLE = "Trendshift Architect (v1.0)"
     CSS = """
-    #app-grid {
-        layout: grid;
-        grid-size: 2;
-        grid-columns: 1fr 1fr;
-        padding: 0 2;
-    }
-    .column {
-        padding: 1 2;
-        margin: 0 1;
-        border: solid cyan;
-    }
-    .section-title {
-        text-style: bold;
-        color: cyan;
-        margin-bottom: 1;
-        margin-top: 1;
-    }
-    .help-box {
-        color: #888888;
-        padding: 1;
-        border-top: dashed #444444;
-        margin-top: 1;
-    }
-    #btn_start {
-        margin-top: 2;
-        width: 100%;
-        text-style: bold;
-    }
+    #app-grid { layout: grid; grid-size: 2; grid-columns: 1fr 1fr; padding: 0 2; }
+    .column { padding: 1 2; margin: 0 1; border: solid cyan; }
+    .section-title { text-style: bold; color: cyan; margin-bottom: 1; margin-top: 1; }
+    .help-box { color: #888888; padding: 1; border-top: dashed #444444; margin-top: 1; }
+    #btn_start { margin-top: 2; width: 100%; text-style: bold; }
     """
-    BINDINGS = [
-        ("escape", "quit", "Quit / Cancel"),
-        ("f5", "start_scrape", "Start Scraping")
-    ]
+    BINDINGS = [("escape", "quit", "Quit / Cancel"), ("f5", "start_scrape", "Start Scraping")]
 
     def compose(self) -> ComposeResult:
         now = datetime.now()
@@ -91,14 +65,14 @@ class TrendshiftWizard(App):
         with Container(id="app-grid"):
             with VerticalScroll(classes="column"):
                 yield Label("📊 Active Feeds", classes="section-title")
-                yield Checkbox("Daily Rankings (/)", id="ep_daily", value=True, tooltip="Today's top trending repositories.")
-                yield Checkbox("Weekly Rankings (/weekly)", id="ep_weekly", value=True, tooltip="Top repositories over the last 7 days.")
-                yield Checkbox("Monthly Rankings (/monthly)", id="ep_monthly", value=True, tooltip="Top repositories over the last 30 days.")
-                yield Checkbox("Yearly Rankings (/yearly)", id="ep_yearly", value=True, tooltip="Top repositories over the last 365 days.")
-                yield Checkbox("Live Mentions", id="ep_live", value=True, tooltip="Real-time mentions feed.")
-                yield Checkbox("GitHub Trending", id="ep_ghtrending", tooltip="GitHub's official trending page aggregated.")
-                yield Checkbox("Trending Developers", id="ep_devs", tooltip="Ranks individual developers by momentum.")
-                yield Checkbox("Repo Engagements", id="ep_repoeng", tooltip="Repositories with sustained contributor activity.")
+                yield Checkbox("Daily Rankings (/)", id="ep_daily", value=True)
+                yield Checkbox("Weekly Rankings (/weekly)", id="ep_weekly", value=True)
+                yield Checkbox("Monthly Rankings (/monthly)", id="ep_monthly", value=True)
+                yield Checkbox("Yearly Rankings (/yearly)", id="ep_yearly", value=True)
+                yield Checkbox("Live Mentions", id="ep_live", value=True)
+                yield Checkbox("GitHub Trending", id="ep_ghtrending")
+                yield Checkbox("Trending Developers", id="ep_devs")
+                yield Checkbox("Repo Engagements", id="ep_repoeng")
                 
                 yield Label("🕰️ Historical Archives", classes="section-title")
                 yield Label("Type 'all' or separate specific dates with commas.", classes="help-box")
@@ -109,8 +83,8 @@ class TrendshiftWizard(App):
             with VerticalScroll(classes="column"):
                 yield Label("⚙️ Extraction Strategy", classes="section-title")
                 yield RadioSet(
-                    RadioButton("Deep Extraction (Slower)", id="depth_deep", value=True, tooltip="Visits EVERY repository page. Gets precise metrics and timestamps."),
-                    RadioButton("Shallow Snapshot (Fast)", id="depth_shallow", tooltip="Only scrapes list pages. Gets rankings, names, and URLs instantly."),
+                    RadioButton("Deep Extraction (Slower)", id="depth_deep", value=True),
+                    RadioButton("Shallow Snapshot (Fast)", id="depth_shallow"),
                     id="rs_depth"
                 )
                 
@@ -135,7 +109,7 @@ class TrendshiftWizard(App):
                     ("Top 30 (Default Tracker)", 30),
                     ("Top 50 (Standard)", 50),
                     ("Top 100 (Deep Dive)", 100),
-                    ("Unlimited (Fetch Everything Available)", 0),
+                    ("Unlimited (Fetch Everything)", 0),
                 ], value=30, id="sel_limit")
                 
                 yield Button("START SCRAPING (F5)", variant="success", id="btn_start")
@@ -209,16 +183,17 @@ def export_formats(selected_formats):
 
     if "csv" in selected_formats or "all" in selected_formats:
         csv_path = OUTPUT_DIR / f"{BASE_FILENAME}.csv"
-        headers = ["Rank Contexts", "Name", "GitHub URL", "Trendshift URL", "Stars", "Forks", "Contributors", "Likes", "Bookmarks", "Created At", "Last Commit"]
+        headers = ["Rank Contexts", "Name", "GitHub URL", "Trendshift URL", "Stars", "Forks", "Contributors", "Likes", "Bookmarks", "Tags", "Created At", "Last Commit"]
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
             writer.writerow(headers)
             for r in records:
-                metrics, timestamps = r.get("metrics", {}), r.get("timestamps", {})
+                metrics, timestamps, tags = r.get("metrics", {}), r.get("timestamps", {}), r.get("tags", [])
                 writer.writerow([
                     ", ".join(r.get("rank_contexts", [])), r.get("name", ""), r.get("github_url", ""), r.get("trendshift_url", ""),
                     metrics.get("stars", ""), metrics.get("forks", ""), metrics.get("contributors", ""),
-                    metrics.get("likes", ""), metrics.get("bookmarks", ""), timestamps.get("created_at", ""), timestamps.get("last_commit", "")
+                    metrics.get("likes", ""), metrics.get("bookmarks", ""), ", ".join(tags), 
+                    timestamps.get("created_at", ""), timestamps.get("last_commit", "")
                 ])
         console.print(f"[bold green]✓ Exported CSV:[/bold green] [cyan]{csv_path}[/cyan]")
         
@@ -248,12 +223,26 @@ async def block_media(route):
     else: await route.continue_()
 
 async def extract_links_from_list(page):
-    links = await page.evaluate('''() => {
-        return Array.from(document.querySelectorAll('a'))
-            .map(a => a.getAttribute('href'))
-            .filter(href => href && (href.includes('/repositories/') || href.includes('/developers/')));
+    # Select each distinct repository card container in visual order, then find its repository link
+    links = await page.evaluate(r'''() => {
+        // Trendshift groups each repository item in a distinct container or section block
+        // We look for elements that contain a repository link
+        const repoLinks = [];
+        const allAnchors = document.querySelectorAll('a[href*="/repositories/"]');
+        
+        for (let a of allAnchors) {
+            const href = a.getAttribute('href');
+            // Ensure we are grabbing the main title/repo link, not a badge or tag link inside the card
+            if (href && href.startsWith('/repositories/') && !href.includes('/api/')) {
+                // Deduplicate while preserving strict visual order
+                if (!repoLinks.includes(href)) {
+                    repoLinks.push(href);
+                }
+            }
+        }
+        return repoLinks;
     }''')
-    return list(dict.fromkeys(links))
+    return links
 
 async def fetch_repo_worker(browser_context, url, contexts, semaphore, progress, task_id, retry_queue):
     async with semaphore:
@@ -266,43 +255,80 @@ async def fetch_repo_worker(browser_context, url, contexts, semaphore, progress,
 
             title = await page.title()
             if "Just a moment..." in title or "Cloudflare" in title:
-                progress.console.print(f"[bold yellow]⚠ WAF block on {url}. Re-queuing for retry...[/bold yellow]")
+                progress.console.print(f"[bold yellow]⚠ WAF block on {url}. Re-queuing...[/bold yellow]")
                 retry_queue.append((url, contexts))
                 await asyncio.sleep(6)
                 return
 
-            # Robust Regex-Powered DOM Parser
-            data = await page.evaluate('''() => {
+            # Precision DOM & JSON-LD Extraction
+            data = await page.evaluate(r'''() => {
                 const rawTitle = document.title || '';
                 const cleanName = rawTitle.split(' — ')[0].trim();
                 const githubLink = cleanName.includes('/') ? `https://github.com/${cleanName}` : null;
                 
-                const getStat = (label) => {
-                    const cards = Array.from(document.querySelectorAll('div, section, article'));
-                    for (let card of cards) {
-                        const txt = card.innerText || '';
-                        if (txt.toLowerCase().includes(label.toLowerCase())) {
-                            const regex = new RegExp(label + `[:\\s]*([\\d,]+)`, 'i');
-                            const match = txt.match(regex);
-                            if (match && match[1]) return match[1];
+                // 1. Extract from JSON-LD Schema if available
+                let ldCreated = null;
+                let ldModified = null;
+                try {
+                    const ldScript = document.querySelector('script[type="application/ld+json"]');
+                    if (ldScript) {
+                        const parsed = JSON.parse(ldScript.textContent);
+                        if (parsed) {
+                            ldCreated = parsed.dateCreated || null;
+                            ldModified = parsed.dateModified || null;
                         }
                     }
-                    return null;
+                } catch (e) {}
+
+                // 2. Extract stats using Lucide icon classes in the stats bar
+                let stars = null;
+                let forks = null;
+                let contributors = null;
+                let lastCommit = null;
+                let createdAt = null;
+
+                const statDivs = Array.from(document.querySelectorAll('.flex.items-center.gap-1'));
+                for (let div of statDivs) {
+                    const txt = div.innerText.trim();
+                    if (div.querySelector('.lucide-star')) {
+                        stars = txt.replace(/[^0-9.,kKmM]/g, '');
+                    } else if (div.querySelector('.lucide-git-fork')) {
+                        forks = txt.replace(/[^0-9.,kKmM]/g, '');
+                    } else if (txt.includes('contributors')) {
+                        const m = txt.match(/([0-9]+)/);
+                        if (m) contributors = m[1];
+                    } else if (txt.startsWith('last commit')) {
+                        lastCommit = txt.replace('last commit', '').trim();
+                    } else if (txt.startsWith('created')) {
+                        createdAt = txt.replace('created', '').trim();
+                    }
+                }
+
+                // Fallback buttons for likes/bookmarks
+                const likeBtn = document.querySelector('button[aria-label*="likes"]');
+                const bookmarkBtn = document.querySelector('button[aria-label*="bookmarks"]');
+                
+                const getTags = () => {
+                    return [...new Set(Array.from(document.querySelectorAll('a'))
+                        .filter(a => a.href.includes('/tags/') || a.href.includes('/categories/'))
+                        .map(a => a.textContent.trim())
+                        .filter(t => t.length > 0))];
                 };
 
                 return {
                     name: cleanName,
                     github_url: githubLink,
+                    tags: getTags(),
                     metrics: {
-                        stars: getStat('Stars') || getStat('Star'),
-                        forks: getStat('Forks') || getStat('Fork'),
-                        contributors: getStat('Contributors'),
-                        likes: getStat('Likes') || getStat('Upvotes'),
-                        bookmarks: getStat('Bookmarks') || getStat('Bookmark')
+                        stars: stars,
+                        forks: forks,
+                        contributors: contributors,
+                        likes: likeBtn ? likeBtn.innerText.trim().replace(/[^0-9]/g, '') : null,
+                        bookmarks: bookmarkBtn ? bookmarkBtn.innerText.trim().replace(/[^0-9]/g, '') : null
                     },
                     timestamps: {
-                        created_at: getStat('Created at') || getStat('Created'),
-                        last_commit: getStat('Last commit') || getStat('Updated')
+                        created_at: ldCreated || createdAt,
+                        last_commit: ldModified || lastCommit
                     }
                 }
             }''')
@@ -314,11 +340,16 @@ async def fetch_repo_worker(browser_context, url, contexts, semaphore, progress,
             async with file_lock:
                 with open(STATE_FILE, 'a', encoding='utf-8') as f:
                     f.write(json.dumps(data) + "\n")
+                    
         except Exception as e:
-            progress.console.print(f"[bold red]✗ Error extracting {url}: {e}[/bold red]")
+            if "TargetClosedError" not in str(e) and "Target page, context or browser has been closed" not in str(e):
+                progress.console.print(f"[bold red]✗ Error extracting {url}: {e}[/bold red]")
         finally:
-            progress.advance(task_id)
-            await page.close()
+            try:
+                progress.advance(task_id)
+                await page.close()
+            except Exception:
+                pass
 
 async def run_scraper(config):
     console.print("\n[dim]Initializing stealth engine...[/dim]")
@@ -328,14 +359,8 @@ async def run_scraper(config):
     repo_to_contexts = {} 
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080}
-        )
+        browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled", "--no-sandbox"])
+        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36", viewport={"width": 1920, "height": 1080})
         
         page = await context.new_page()
         limit_text = "Infinite" if config['limit'] == 0 else config['limit']
@@ -356,8 +381,7 @@ async def run_scraper(config):
                             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                             await page.wait_for_timeout(1200)
                             curr_height = await page.evaluate("document.body.scrollHeight")
-                            if curr_height == prev_height:
-                                break
+                            if curr_height == prev_height: break
                             prev_height = curr_height
                             
                     links = await extract_links_from_list(page)
@@ -404,16 +428,24 @@ async def run_scraper(config):
         
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(complete_style="green"), TaskProgressColumn(), TimeRemainingColumn()) as progress:
             task_id = progress.add_task("[cyan]Scraping repositories...", total=total_urls)
-            tasks = [fetch_repo_worker(context, url, contexts, semaphore, progress, task_id, retry_queue) for url, contexts in urls_to_scrape.items()]
-            await asyncio.gather(*tasks)
+            
+            try:
+                tasks = [fetch_repo_worker(context, url, contexts, semaphore, progress, task_id, retry_queue) for url, contexts in urls_to_scrape.items()]
+                await asyncio.gather(*tasks)
 
-            if retry_queue:
-                console.print(f"\n[bold yellow]Retrying {len(retry_queue)} WAF-blocked URLs...[/bold yellow]")
-                retry_task_id = progress.add_task("[yellow]Retrying blocked items...", total=len(retry_queue))
-                retry_tasks = [fetch_repo_worker(context, url, contexts, semaphore, progress, retry_task_id, []) for url, contexts in retry_queue]
-                await asyncio.gather(*retry_tasks)
+                if retry_queue:
+                    console.print(f"\n[bold yellow]Retrying {len(retry_queue)} WAF-blocked URLs...[/bold yellow]")
+                    retry_task_id = progress.add_task("[yellow]Retrying blocked items...", total=len(retry_queue))
+                    retry_tasks = [fetch_repo_worker(context, url, contexts, semaphore, progress, retry_task_id, []) for url, contexts in retry_queue]
+                    await asyncio.gather(*retry_tasks)
+            except asyncio.CancelledError:
+                pass
 
-        await browser.close()
+        try:
+            await browser.close()
+        except Exception:
+            pass
+            
         console.print("\n[bold green]Phase 3: Generating Artifacts[/bold green]")
         export_formats(config["formats"])
         console.print("[bold green]🎉 Done![/bold green]")
@@ -450,6 +482,7 @@ def main():
         asyncio.run(run_scraper(config))
     except KeyboardInterrupt: 
         console.print("\n[bold yellow]Execution aborted by user. Partial data saved to cache.[/bold yellow]")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
