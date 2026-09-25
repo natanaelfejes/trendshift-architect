@@ -199,6 +199,25 @@ def latest_run_file():
     runs = sorted(RUNS_DIR.glob("[0-9]" * 4 + "-" + "[0-9]" * 2 + "-" + "[0-9]" * 2 + ".json"))
     return runs[-1] if runs else None
 
+
+def previous_successful_enrichments():
+    """{name: enrichment} for the most recent successful (error-free) GitHub enrichment of each
+    repo across all past runs. A failed attempt (e.g. rate-limited) does NOT count, so it gets
+    retried on the next run instead of being treated as done forever."""
+    enrichments = {}
+    if not RUNS_DIR.exists():
+        return enrichments
+    for path in sorted(RUNS_DIR.glob("[0-9]" * 4 + "-" + "[0-9]" * 2 + "-" + "[0-9]" * 2 + ".json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        for r in data.get("repos", []):
+            enr = r.get("enrichment")
+            if enr and not enr.get("error"):
+                enrichments[r["name"]] = enr
+    return enrichments
+
 def ensure_playwright_browsers():
     try:
         subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, capture_output=True, text=True)
@@ -490,7 +509,7 @@ async def fetch_repo_worker(browser_context, url, contexts, semaphore, progress,
             except Exception:
                 pass
 
-def write_run_and_diff(repo_to_contexts, cache_status, github_token):
+def write_run_and_diff(repo_to_contexts, github_token):
     """Enrich brand-new repos, write runs/<date>.json, diff it against the previous run, print the summary."""
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     prev_path = latest_run_file()
@@ -510,7 +529,12 @@ def write_run_and_diff(repo_to_contexts, cache_status, github_token):
                 views[m.group(2)] = min(int(m.group(1)), views.get(m.group(2), int(m.group(1))))
         current_repos[name] = {"name": name, "trendshift_url": url, "views": views, "list_stars": list_stars}
 
-    new_names = [n for n, r in current_repos.items() if r["trendshift_url"] not in cache_status]
+    past_enrichments = previous_successful_enrichments()
+    for name, enr in past_enrichments.items():
+        if name in current_repos:
+            current_repos[name]["enrichment"] = enr
+
+    new_names = [n for n in current_repos if n not in past_enrichments]
     if new_names:
         console.print(f"\n[bold cyan]Enriching {len(new_names)} new repo(s) via GitHub API...[/bold cyan]")
     for name in new_names:
@@ -531,7 +555,7 @@ def write_run_and_diff(repo_to_contexts, cache_status, github_token):
 
 
 def finalize_run(config, repo_to_contexts, cache_status):
-    write_run_and_diff(repo_to_contexts, cache_status, os.environ.get("GITHUB_TOKEN"))
+    write_run_and_diff(repo_to_contexts, os.environ.get("GITHUB_TOKEN"))
     if config["shallow"]:
         console.print("\n[bold cyan]Shallow Mode: Writing rankings to cache...[/bold cyan]")
         with open(STATE_FILE, 'a', encoding='utf-8') as f:
@@ -663,6 +687,18 @@ async def run_scraper(config):
         export_formats(config["formats"])
         console.print("[bold green]🎉 Done![/bold green]")
 
+def load_dotenv():
+    """Load KEY=VALUE lines from a .env file in the cwd into os.environ, without overriding real env vars."""
+    env_path = Path.cwd() / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
 def get_cli_config():
     parser = argparse.ArgumentParser(description="Trendshift Advanced Scraper")
     parser.add_argument("--interactive", action="store_true", help="Launch the TUI wizard instead of the weekly-job pipeline")
@@ -683,6 +719,7 @@ def get_cli_config():
     }
 
 def main():
+    load_dotenv()
     config = get_cli_config()
     if not config:
         app = TrendshiftWizard()

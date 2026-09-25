@@ -10,3 +10,4 @@ sample_sites/
 *.mhtml
 snapshots/
 runs/
+.env

@@ -40,10 +40,39 @@ zero repo links — any of those **aborts the whole run** with a clear error ins
 block page as data.
 
 Repos not seen in any previous run are enriched via the GitHub REST API (stars, forks, license,
-topics, README excerpt, etc). Set `GITHUB_TOKEN` in the environment to raise the rate limit;
-it's optional. Output lands in `runs/YYYY-MM-DD.json` plus a `runs/YYYY-MM-DD-diff.json` (new
-entries, biggest risers, drop-outs vs. the previous run) — the diff is what feeds the AI-stack
-watchlist threads.
+topics, README excerpt, etc). Output lands in `runs/YYYY-MM-DD.json` plus a
+`runs/YYYY-MM-DD-diff.json` (new entries, biggest risers, drop-outs vs. the previous run) — the
+diff is what feeds the AI-stack watchlist threads.
+
+### GitHub token (optional, but you'll want it)
+
+Enrichment works without a token, but GitHub caps unauthenticated API requests at 60/hour —
+easy to blow through on a single run, since each new repo makes 2 requests (repo + README). A
+token raises that to 5000/hour. **Never commit a token** — this repo is public.
+
+1. GitHub → Settings → Developer settings → [Fine-grained tokens](https://github.com/settings/personal-access-tokens/new)
+2. **Repository access:** "Public Repositories (read-only)" — no access to your private repos, no write scopes.
+3. Set an expiration (90 days is fine, it's read-only and public-only), generate, copy the token.
+4. Put it in a `.env` file in the project root (copy `.env.example` → `.env`):
+   ```
+   GITHUB_TOKEN=github_pat_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   ```
+   `.env` is gitignored — the scraper loads it automatically, no shell setup needed. It's only
+   ever read from the environment, never logged or written to `runs/`/`snapshots/`.
+
+Alternatively, export it in your shell instead of using `.env`:
+
+```powershell
+# PowerShell, this session only
+$env:GITHUB_TOKEN = "github_pat_..."
+
+# PowerShell, persists across new terminals for your user account
+[System.Environment]::SetEnvironmentVariable("GITHUB_TOKEN", "github_pat_...", "User")
+```
+```bash
+# bash, this session only
+export GITHUB_TOKEN=github_pat_...
+```
 
 ```bash
 uv run scraper.py                    # live weekly run
