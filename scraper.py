@@ -9,14 +9,18 @@
 
 import asyncio
 import csv
+import email
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import argparse
 import shutil
-from datetime import datetime
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 from playwright.async_api import async_playwright
@@ -37,6 +41,163 @@ OUTPUT_DIR = Path.cwd()
 BASE_FILENAME = "trendshift_data"
 BASE_URL = "https://trendshift.io"
 file_lock = asyncio.Lock()
+
+# Fixed weekly-job views: list pages only. Deep per-repo pages are opt-in (--deep)
+# because they're what triggered Cloudflare rate-limiting in the past.
+VIEWS = {
+    "daily": "/",
+    "weekly": "/weekly",
+    "monthly": "/monthly",
+    "yearly": "/yearly",
+    "yearly-2025": "/yearly/2025",
+    "yearly-2024": "/yearly/2024",
+    "live-mentions": "/live-mentions",
+    "github-trending-repositories": "/github-trending-repositories",
+}
+SNAPSHOT_DIR = Path.cwd() / "snapshots"
+RUNS_DIR = Path.cwd() / "runs"
+BLOCK_TITLE_MARKERS = ("just a moment", "cloudflare", "attention required", "checking your browser", "access denied")
+ANCHOR_RE = re.compile(r'<a[^>]*href="([^"]*?/repositories/\d+)"[^>]*>([^<]*)</a>', re.I)
+STAR_RE = re.compile(r'lucide-star.*?font-medium">([\d,.]+[kKmM]?)</span>', re.S)
+
+
+class BlockDetected(Exception):
+    """Raised when a Cloudflare/challenge page or a non-200/empty list page is hit. Aborts the whole run."""
+
+
+def is_challenge_title(title):
+    return any(marker in (title or "").lower() for marker in BLOCK_TITLE_MARKERS)
+
+
+def is_block_page(html, title="", status=200):
+    if status is not None and status != 200:
+        return True
+    if is_challenge_title(title):
+        return True
+    if not ANCHOR_RE.search(html or ""):
+        return True
+    return False
+
+
+def slugify(label):
+    return re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
+
+
+def parse_view_html(html):
+    """Extract (rank, owner/repo, trendshift_url, list_stars) tuples from a rendered list page, in document order."""
+    entries = []
+    seen = set()
+    for m in ANCHOR_RE.finditer(html):
+        url, name = m.group(1), m.group(2).strip()
+        if "/" not in name or name in seen:
+            continue
+        seen.add(name)
+        star_match = STAR_RE.search(html, m.end(), m.end() + 1000)
+        entries.append({
+            "rank": len(entries) + 1,
+            "name": name,
+            "trendshift_url": url,
+            "list_stars": star_match.group(1) if star_match else None,
+        })
+    return entries
+
+
+def read_html_file(path):
+    if path.suffix.lower() == ".mhtml":
+        with open(path, "rb") as f:
+            msg = email.message_from_binary_file(f)
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                return part.get_payload(decode=True).decode("utf-8", errors="replace")
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def parse_snapshots_dir(dir_path):
+    """Parse every .html/.mhtml snapshot in a directory. Returns {trendshift_url: [contexts]} and raises BlockDetected on a block page."""
+    repo_to_contexts = {}
+    dir_path = Path(dir_path)
+    for path in sorted(dir_path.glob("*.html")) + sorted(dir_path.glob("*.mhtml")):
+        html = read_html_file(path)
+        title_match = re.search(r"<title[^>]*>([^<]*)</title>", html, re.I)
+        title = title_match.group(1) if title_match else ""
+        if is_challenge_title(title):
+            raise BlockDetected(f"Block page detected while parsing snapshot {path}")
+        if not ANCHOR_RE.search(html or ""):
+            if path.suffix.lower() == ".html":
+                # Our own saved snapshots are always list pages; zero links means a missed block.
+                raise BlockDetected(f"Block page detected while parsing snapshot {path}")
+            console.print(f"[dim]Skipping {path.name}: no repo links (not a list page)[/dim]")
+            continue
+        label = path.stem
+        for entry in parse_view_html(html):
+            url = entry["trendshift_url"]
+            repo_to_contexts.setdefault(url, {"contexts": [], "list_stars": None, "name": entry["name"]})
+            repo_to_contexts[url]["contexts"].append(f"#{entry['rank']} {label}")
+            if repo_to_contexts[url]["list_stars"] is None:
+                repo_to_contexts[url]["list_stars"] = entry["list_stars"]
+    return repo_to_contexts
+
+
+def github_enrich_repo(name, token=None):
+    """Fetch created_at, pushed_at, license, stars, forks, open_issues, topics, archived + ~2KB of README for owner/repo."""
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "trendshift-scraper"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        req = urllib.request.Request(f"https://api.github.com/repos/{name}", headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        info = {
+            "created_at": data.get("created_at"),
+            "pushed_at": data.get("pushed_at"),
+            "license": (data.get("license") or {}).get("spdx_id"),
+            "stars": data.get("stargazers_count"),
+            "forks": data.get("forks_count"),
+            "open_issues": data.get("open_issues_count"),
+            "topics": data.get("topics", []),
+            "archived": data.get("archived"),
+        }
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as e:
+        return {"error": str(e)}
+
+    try:
+        req = urllib.request.Request(f"https://api.github.com/repos/{name}/readme", headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            readme_data = json.loads(resp.read())
+        import base64
+        readme_bytes = base64.b64decode(readme_data.get("content", ""))
+        info["readme_excerpt"] = readme_bytes[:2048].decode("utf-8", errors="replace")
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError):
+        info["readme_excerpt"] = None
+    return info
+
+
+def compute_diff(current_repos, previous_repos):
+    """current_repos/previous_repos: {name: {"views": {view: rank}, ...}}. Returns new/dropped/risers."""
+    current_names, previous_names = set(current_repos), set(previous_repos)
+    new_entries = sorted(current_names - previous_names)
+    dropped_out = sorted(previous_names - current_names)
+
+    risers = []
+    for name in current_names & previous_names:
+        curr_best = min(current_repos[name]["views"].values(), default=None)
+        prev_best = min(previous_repos[name]["views"].values(), default=None)
+        if curr_best is None or prev_best is None:
+            continue
+        delta = prev_best - curr_best
+        if delta > 0:
+            risers.append({"name": name, "prev_rank": prev_best, "curr_rank": curr_best, "delta": delta})
+    risers.sort(key=lambda r: r["delta"], reverse=True)
+
+    return {"new_entries": new_entries, "dropped_out": dropped_out, "biggest_risers": risers[:10]}
+
+
+def latest_run_file():
+    if not RUNS_DIR.exists():
+        return None
+    runs = sorted(RUNS_DIR.glob("[0-9]" * 4 + "-" + "[0-9]" * 2 + "-" + "[0-9]" * 2 + ".json"))
+    return runs[-1] if runs else None
 
 def ensure_playwright_browsers():
     try:
@@ -109,8 +270,8 @@ class TrendshiftWizard(App):
             with VerticalScroll(classes="column"):
                 yield Label("⚙️ Extraction Strategy", classes="section-title")
                 yield RadioSet(
-                    RadioButton("Deep Extraction (Slower)", id="depth_deep", value=True, tooltip="Visits EVERY repository page. Gets precise metrics and timestamps."),
-                    RadioButton("Shallow Snapshot (Fast)", id="depth_shallow", tooltip="Only scrapes list pages. Gets rankings, names, and URLs instantly."),
+                    RadioButton("Deep Extraction (Slower, triggers rate-limiting)", id="depth_deep", tooltip="Visits EVERY repository page. Gets precise metrics and timestamps."),
+                    RadioButton("Shallow Snapshot (Fast)", id="depth_shallow", value=True, tooltip="Only scrapes list pages. Gets rankings, names, and URLs instantly."),
                     id="rs_depth"
                 )
                 
@@ -247,14 +408,6 @@ async def block_media(route):
     if route.request.resource_type in ["image", "media", "font"]: await route.abort()
     else: await route.continue_()
 
-async def extract_links_from_list(page):
-    links = await page.evaluate('''() => {
-        return Array.from(document.querySelectorAll('a'))
-            .map(a => a.getAttribute('href'))
-            .filter(href => href && (href.includes('/repositories/') || href.includes('/developers/')));
-    }''')
-    return list(dict.fromkeys(links))
-
 async def fetch_repo_worker(browser_context, url, contexts, semaphore, progress, task_id, retry_queue):
     async with semaphore:
         page = await browser_context.new_page()
@@ -271,20 +424,30 @@ async def fetch_repo_worker(browser_context, url, contexts, semaphore, progress,
                 await asyncio.sleep(6)
                 return
 
-            # Robust Regex-Powered DOM Parser
+            # Precision DOM Selector for Trendshift Stats
             data = await page.evaluate('''() => {
                 const rawTitle = document.title || '';
                 const cleanName = rawTitle.split(' — ')[0].trim();
                 const githubLink = cleanName.includes('/') ? `https://github.com/${cleanName}` : null;
                 
-                const getStat = (label) => {
-                    const cards = Array.from(document.querySelectorAll('div, section, article'));
-                    for (let card of cards) {
-                        const txt = card.innerText || '';
-                        if (txt.toLowerCase().includes(label.toLowerCase())) {
-                            const regex = new RegExp(label + `[:\\s]*([\\d,]+)`, 'i');
-                            const match = txt.match(regex);
-                            if (match && match[1]) return match[1];
+                // Helper to find stat values based on adjacent label text
+                const getStatByLabel = (labelText) => {
+                    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                    while (walker.nextNode()) {
+                        let node = walker.currentNode;
+                        if (node.nodeValue.trim().toLowerCase() === labelText.toLowerCase()) {
+                            // Look up through parents to find the stat container
+                            let parent = node.parentElement;
+                            for (let i = 0; i < 4; i++) {
+                                if (!parent) break;
+                                const text = parent.innerText || '';
+                                // Match numbers with commas/k suffixes near the label
+                                const match = text.replace(labelText, '').trim().match(/([\\d,]+\\.?[\\d]*[kKmM]?)/);
+                                if (match && match[1]) {
+                                    return match[1];
+                                }
+                                parent = parent.parentElement;
+                            }
                         }
                     }
                     return null;
@@ -294,15 +457,15 @@ async def fetch_repo_worker(browser_context, url, contexts, semaphore, progress,
                     name: cleanName,
                     github_url: githubLink,
                     metrics: {
-                        stars: getStat('Stars') || getStat('Star'),
-                        forks: getStat('Forks') || getStat('Fork'),
-                        contributors: getStat('Contributors'),
-                        likes: getStat('Likes') || getStat('Upvotes'),
-                        bookmarks: getStat('Bookmarks') || getStat('Bookmark')
+                        stars: getStatByLabel('Stars') || getStatByLabel('Star'),
+                        forks: getStatByLabel('Forks') || getStatByLabel('Fork'),
+                        contributors: getStatByLabel('Contributors'),
+                        likes: getStatByLabel('Likes') || getStatByLabel('Upvotes'),
+                        bookmarks: getStatByLabel('Bookmarks') || getStatByLabel('Bookmark')
                     },
                     timestamps: {
-                        created_at: getStat('Created at') || getStat('Created'),
-                        last_commit: getStat('Last commit') || getStat('Updated')
+                        created_at: getStatByLabel('Created at') || getStatByLabel('Created'),
+                        last_commit: getStatByLabel('Last commit') || getStatByLabel('Updated')
                     }
                 }
             }''')
@@ -320,12 +483,77 @@ async def fetch_repo_worker(browser_context, url, contexts, semaphore, progress,
             progress.advance(task_id)
             await page.close()
 
+def write_run_and_diff(repo_to_contexts, cache_status, github_token):
+    """Enrich brand-new repos, write runs/<date>.json, diff it against the previous run, print the summary."""
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    prev_path = latest_run_file()
+    previous_repos = {}
+    if prev_path:
+        previous_repos = {r["name"]: r for r in json.loads(prev_path.read_text(encoding="utf-8"))["repos"]}
+
+    current_repos = {}
+    for url, info in repo_to_contexts.items():
+        contexts = info["contexts"]
+        list_stars = info["list_stars"]
+        name = info["name"]
+        views = {}
+        for ctx in contexts:
+            m = re.match(r"#(\d+)\s+(.+)", ctx)
+            if m:
+                views[m.group(2)] = min(int(m.group(1)), views.get(m.group(2), int(m.group(1))))
+        current_repos[name] = {"name": name, "trendshift_url": url, "views": views, "list_stars": list_stars}
+
+    new_names = [n for n, r in current_repos.items() if r["trendshift_url"] not in cache_status]
+    if new_names:
+        console.print(f"\n[bold cyan]Enriching {len(new_names)} new repo(s) via GitHub API...[/bold cyan]")
+    for name in new_names:
+        gh_name = name if "/" in name else None
+        current_repos[name]["enrichment"] = github_enrich_repo(gh_name, github_token) if gh_name else None
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    run_path = RUNS_DIR / f"{today}.json"
+    run_path.write_text(json.dumps({"date": today, "repos": list(current_repos.values())}, indent=2, ensure_ascii=False), encoding="utf-8")
+    console.print(f"[bold green]✓ Run snapshot:[/bold green] [cyan]{run_path}[/cyan]")
+
+    diff = compute_diff(current_repos, previous_repos)
+    diff_path = RUNS_DIR / f"{today}-diff.json"
+    diff_path.write_text(json.dumps({"date": today, "compared_to": prev_path.stem if prev_path else None, **diff}, indent=2, ensure_ascii=False), encoding="utf-8")
+    console.print(f"[bold green]✓ Diff:[/bold green] [cyan]{diff_path}[/cyan] "
+                  f"([green]{len(diff['new_entries'])} new[/green], [red]{len(diff['dropped_out'])} dropped[/red], "
+                  f"[yellow]{len(diff['biggest_risers'])} risers[/yellow])")
+
+
+def finalize_run(config, repo_to_contexts, cache_status):
+    write_run_and_diff(repo_to_contexts, cache_status, os.environ.get("GITHUB_TOKEN"))
+    if config["shallow"]:
+        console.print("\n[bold cyan]Shallow Mode: Writing rankings to cache...[/bold cyan]")
+        with open(STATE_FILE, 'a', encoding='utf-8') as f:
+            for url, info in repo_to_contexts.items():
+                if url not in cache_status:
+                    f.write(json.dumps({"trendshift_url": url, "rank_contexts": info["contexts"], "scrape_mode": "shallow"}) + "\n")
+        export_formats(config["formats"])
+        return True
+    return False
+
+
 async def run_scraper(config):
+    cache_status = get_scraped_cache_status()
+
+    if config.get("from_dir"):
+        console.print(f"\n[bold cyan]Offline mode: parsing snapshots from {config['from_dir']}[/bold cyan]")
+        try:
+            repo_to_contexts = parse_snapshots_dir(config["from_dir"])
+        except BlockDetected as e:
+            console.print(f"[bold red]✗ BLOCKED: {e}[/bold red]")
+            sys.exit(1)
+        finalize_run(config, repo_to_contexts, cache_status)
+        console.print("[bold green]🎉 Done![/bold green]")
+        return
+
     console.print("\n[dim]Initializing stealth engine...[/dim]")
     ensure_playwright_browsers()
-    
-    cache_status = get_scraped_cache_status()
-    repo_to_contexts = {} 
+
+    repo_to_contexts = {}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -338,56 +566,64 @@ async def run_scraper(config):
         )
         
         page = await context.new_page()
-        limit_text = "Infinite" if config['limit'] == 0 else config['limit']
-        console.print(f"\n[bold green]Phase 1: Discovering endpoints (Limit: {limit_text})[/bold green]")
-        
+        date_dir = SNAPSHOT_DIR / datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        date_dir.mkdir(parents=True, exist_ok=True)
+        console.print(f"\n[bold green]Phase 1: Fetching list pages sequentially into {date_dir}[/bold green]")
+
+        endpoints = list(config["endpoints"].items())
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as progress:
-            for label, url_path in config["endpoints"].items():
+            for i, (label, url_path) in enumerate(endpoints):
+                if i > 0:
+                    await asyncio.sleep(random.uniform(20, 30))
                 url = urljoin(BASE_URL, url_path)
-                task = progress.add_task(f"Scanning {label}...", total=None)
-                
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                    await page.wait_for_timeout(1000)
-                    
-                    if config["limit"] == 0 or config["limit"] > 25:
-                        prev_height = 0
-                        for _ in range(12):
-                            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                            await page.wait_for_timeout(1200)
-                            curr_height = await page.evaluate("document.body.scrollHeight")
-                            if curr_height == prev_height:
-                                break
-                            prev_height = curr_height
-                            
-                    links = await extract_links_from_list(page)
-                    if config["limit"] > 0: links = links[:config["limit"]]
-                        
-                    for idx, link in enumerate(links):
-                        fl = urljoin(BASE_URL, link)
-                        if fl not in repo_to_contexts: repo_to_contexts[fl] = []
-                        repo_to_contexts[fl].append(f"#{idx + 1} {label}")
-                    progress.console.print(f"[dim]✓ {label}: Found {len(links)} items[/dim]")
-                except Exception as e:
-                    progress.console.print(f"[red]✗ Failed {label}: {e}[/red]")
+                slug = slugify(label)
+                task = progress.add_task(f"Fetching {label}...", total=None)
+
+                resp = await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_timeout(1000)
+
+                prev_height = 0
+                for _ in range(12):
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await page.wait_for_timeout(1200)
+                    curr_height = await page.evaluate("document.body.scrollHeight")
+                    if curr_height == prev_height:
+                        break
+                    prev_height = curr_height
+
+                if slug == "live-mentions":
+                    for _ in range(5):
+                        btn = page.locator("button:has-text('Load more')").first
+                        if await btn.count() == 0:
+                            break
+                        await btn.click()
+                        await page.wait_for_timeout(1200)
+
+                status = resp.status if resp else None
+                title = await page.title()
+                html = await page.content()
+                if is_block_page(html, title, status):
+                    raise BlockDetected(f"{label} ({url}) returned status={status}, title='{title}'")
+
+                (date_dir / f"{slug}.html").write_text(html, encoding="utf-8")
+                for entry in parse_view_html(html):
+                    fl = entry["trendshift_url"]
+                    repo_to_contexts.setdefault(fl, {"contexts": [], "list_stars": None, "name": entry["name"]})
+                    repo_to_contexts[fl]["contexts"].append(f"#{entry['rank']} {label}")
+                    if repo_to_contexts[fl]["list_stars"] is None:
+                        repo_to_contexts[fl]["list_stars"] = entry["list_stars"]
+                progress.console.print(f"[dim]✓ {label}: found {len(parse_view_html(html))} items[/dim]")
                 progress.remove_task(task)
         await page.close()
 
-        if config["shallow"]:
-            console.print("\n[bold cyan]Shallow Mode: Writing rankings to cache...[/bold cyan]")
-            async with file_lock:
-                with open(STATE_FILE, 'a', encoding='utf-8') as f:
-                    for url, contexts in repo_to_contexts.items():
-                        if url not in cache_status:
-                            f.write(json.dumps({"trendshift_url": url, "rank_contexts": contexts, "scrape_mode": "shallow"}) + "\n")
-            export_formats(config["formats"])
+        if finalize_run(config, repo_to_contexts, cache_status):
             await browser.close()
             return
 
         urls_to_scrape = {}
-        for url, contexts in repo_to_contexts.items():
+        for url, info in repo_to_contexts.items():
             if url not in cache_status or cache_status[url] == "shallow":
-                urls_to_scrape[url] = contexts
+                urls_to_scrape[url] = info["contexts"]
 
         total_urls = len(urls_to_scrape)
         if total_urls == 0:
@@ -420,36 +656,40 @@ async def run_scraper(config):
 
 def get_cli_config():
     parser = argparse.ArgumentParser(description="Trendshift Advanced Scraper")
-    parser.add_argument("--interactive", action="store_true", help="Force interactive mode")
-    parser.add_argument("--shallow", action="store_true", help="Skip deep scraping")
-    parser.add_argument("--limit", type=int, default=0, help="Max items per category")
-    parser.add_argument("--concurrency", type=int, default=2, help="Concurrent browser tabs")
+    parser.add_argument("--interactive", action="store_true", help="Launch the TUI wizard instead of the weekly-job pipeline")
+    parser.add_argument("--deep", action="store_true", help="Also visit every repo's detail page (slower, caused rate-limiting in the past)")
+    parser.add_argument("--from-dir", help="Parse snapshots (.html/.mhtml) from this directory instead of fetching live")
+    parser.add_argument("--concurrency", type=int, default=1, help="Concurrent browser tabs for --deep")
     parser.add_argument("--format", choices=["all", "json", "csv", "jsonl"], default="all")
-    parser.add_argument("--endpoints", nargs="*", help="Direct URL paths")
-    
+    parser.add_argument("--endpoints", nargs="*", help="Direct URL paths (default: the fixed weekly view list)")
+
     args = parser.parse_args()
-    if any([args.shallow, args.limit, args.endpoints, args.concurrency != 2, args.format != "all"]) and not args.interactive:
-        return {
-            "shallow": args.shallow, "limit": args.limit, "concurrency": args.concurrency,
-            "formats": [args.format] if args.format != "all" else ["json", "csv", "jsonl"],
-            "endpoints": {p: p for p in (args.endpoints or ["/"])}
-        }
-    return None
+    if args.interactive:
+        return None
+    return {
+        "shallow": not args.deep, "limit": 0, "concurrency": args.concurrency,
+        "formats": [args.format] if args.format != "all" else ["json", "csv", "jsonl"],
+        "endpoints": {p: p for p in args.endpoints} if args.endpoints else dict(VIEWS),
+        "from_dir": args.from_dir,
+    }
 
 def main():
     config = get_cli_config()
     if not config:
         app = TrendshiftWizard()
         config = app.run()
-        
+
     if not config:
         console.print("[bold yellow]Setup aborted by user. Exiting.[/bold yellow]")
         return
         
-    try: 
+    try:
         asyncio.run(run_scraper(config))
-    except KeyboardInterrupt: 
+    except KeyboardInterrupt:
         console.print("\n[bold yellow]Execution aborted by user. Partial data saved to cache.[/bold yellow]")
+    except BlockDetected as e:
+        console.print(f"\n[bold red]✗ BLOCKED, aborting run: {e}[/bold red]")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

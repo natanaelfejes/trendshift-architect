@@ -6,3 +6,7 @@ __pycache__/
 .venv/
 trendshift_data.*
 .DS_Store
+sample_sites/
+*.mhtml
+snapshots/
+runs/
