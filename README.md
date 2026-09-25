@@ -22,11 +22,13 @@ A high-performance, asynchronous CLI scraper and TUI dashboard for extracting tr
 
 ## Quick Start
 
-Run the interactive dashboard directly with zero manual setup:
+Zero manual setup, runs the weekly job (see below):
 
 ```bash
 uv run scraper.py
 ```
+
+For the old point-and-click TUI wizard, use `uv run scraper.py --interactive`.
 
 ## Weekly Job (default, no flags)
 
@@ -52,8 +54,9 @@ uv run scraper.py --from-dir sample_sites           # parse the offline sample p
 ## Deep Mode (off by default)
 
 `--deep` additionally visits every repository's detail page for precise stars/forks/contributor
-counts. **This is what triggered Cloudflare rate-limiting in the past** — it's opt-in and not
-part of the weekly job. Possible future work: a lower-frequency deep pass with longer backoff.
+counts, tags, and JSON-LD created/updated timestamps. **This is what triggered Cloudflare
+rate-limiting in the past** — it's opt-in and not part of the weekly job. Possible future work:
+a lower-frequency deep pass with longer backoff.
 
 ## CLI Power-User Flags
 
