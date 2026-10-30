@@ -57,7 +57,8 @@ VIEWS = {
 SNAPSHOT_DIR = Path.cwd() / "snapshots"
 RUNS_DIR = Path.cwd() / "runs"
 BLOCK_TITLE_MARKERS = ("just a moment", "cloudflare", "attention required", "checking your browser", "access denied")
-ANCHOR_RE = re.compile(r'<a[^>]*href="([^"]*?/repositories/\d+)"[^>]*>([^<]*)</a>', re.I)
+# Name = anchor text up to the first child tag; list rows nest a <span> after the name.
+ANCHOR_RE = re.compile(r'<a[^>]*href="([^"]*?/repositories/\d+)"[^>]*>([^<]*)<', re.I)
 STAR_RE = re.compile(r'lucide-star.*?font-medium">([\d,.]+[kKmM]?)</span>', re.S)
 
 
