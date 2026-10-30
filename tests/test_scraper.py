@@ -15,6 +15,13 @@ def test_parses_sample_site():
     assert all("/" in e["name"] for e in entries)
 
 
+def test_parses_anchor_with_nested_tags():
+    html = ('<a href="/repositories/1">plain/podium</a>'
+            '<a href="/repositories/2">owner/listrow<span><svg></svg></span></a>'
+            '<a aria-label="Mentioned on X" href="/repositories/2"><svg></svg></a>')
+    assert [e["name"] for e in parse_view_html(html)] == ["plain/podium", "owner/listrow"]
+
+
 def test_block_page_raises():
     fixture_dir = Path(__file__).resolve().parent / "fixtures"
     try:
@@ -25,6 +32,6 @@ def test_block_page_raises():
 
 
 if __name__ == "__main__":
-    test_parses_sample_site()
+    test_parses_anchor_with_nested_tags()
     test_block_page_raises()
     print("OK")
